@@ -1,24 +1,72 @@
-from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
-from astrbot.api.star import Context, Star, register
-from astrbot.api import logger
+import aiohttp
+from astrbot.api.all import *
+from astrbot.api.message_components import Image
 
-@register("helloworld", "YourName", "一个简单的 Hello World 插件", "1.0.0")
-class MyPlugin(Star):
-    def __init__(self, context: Context):
+@register(
+    name="serpapi_lens",
+    author="YourName",
+    version="1.0.0",
+    description="使用 SerpApi 进行 Google Lens 视觉以图搜图"
+)
+class SerpApiLensPlugin(Star):
+    def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
+        self.config = config or {}
 
-    async def initialize(self):
-        """可选择实现异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""
+    @llm_tool(name="google_lens_search")
+    async def google_lens_search(self, event: AstrMessageEvent) -> str:
+        """当用户发送图片询问图中的人物是谁、物品型号、动植物品种或要求以图搜图时，调用此工具进行 Google Lens 视觉检索。"""
+        api_key = self.config.get("api_key", "").strip()
+        if not api_key:
+            return "错误：未配置 SerpApi API Key。"
 
-    # 注册指令的装饰器。指令名为 helloworld。注册成功后，发送 `/helloworld` 就会触发这个指令，并回复 `你好, {user_name}!`
-    @filter.command("helloworld")
-    async def helloworld(self, event: AstrMessageEvent):
-        """这是一个 hello world 指令""" # 这是 handler 的描述，将会被解析方便用户了解插件内容。建议填写。
-        user_name = event.get_sender_name()
-        message_str = event.message_str # 用户发的纯文本消息字符串
-        message_chain = event.get_messages() # 用户所发的消息的消息链 # from astrbot.api.message_components import *
-        logger.info(message_chain)
-        yield event.plain_result(f"Hello, {user_name}, 你发了 {message_str}!") # 发送一条纯文本消息
+        # 从消息组件中提取图片 URL
+        image_url = None
+        for comp in event.message_obj.message:
+            if isinstance(comp, Image):
+                # 优先获取图片的公网 URL
+                image_url = getattr(comp, "url", None) or getattr(comp, "path", None)
+                break
 
-    async def terminate(self):
-        """可选择实现异步的插件销毁方法，当插件被卸载/停用时会调用。"""
+        if not image_url:
+            return "错误：未在当前消息中检测到图片，无法执行 Google Lens 搜索。"
+
+        # 请求 SerpApi 的 Google Lens 引擎
+        params = {
+            "engine": "google_lens",
+            "url": image_url,
+            "api_key": api_key,
+            "hl": "zh-cn"
+        }
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get("https://serpapi.com/search", params=params, timeout=20) as resp:
+                    if resp.status != 200:
+                        return f"Google Lens 搜索失败，HTTP 状态码: {resp.status}"
+                    data = await resp.json()
+
+            results = []
+            
+            # 1. 提取核心视觉匹配（Visual Matches）
+            visual_matches = data.get("visual_matches", [])[:4]
+            for match in visual_matches:
+                title = match.get("title", "")
+                source = match.get("source", "")
+                link = match.get("link", "")
+                results.append(f"匹配标题: {title}\n来源: {source}\n参考链接: {link}")
+
+            # 2. 提取知识图谱/标签（Knowledge Graph / Tags）
+            knowledge_graph = data.get("knowledge_graph", {})
+            if knowledge_graph:
+                kg_title = knowledge_graph.get("title", "")
+                kg_type = knowledge_graph.get("type", "")
+                results.insert(0, f"识别实体: {kg_title} ({kg_type})")
+
+            if not results:
+                return "Google Lens 未找到高相似度的匹配结果。"
+
+            return "\n\n".join(results)
+
+        except Exception as e:
+            return f"执行视觉搜索时发生异常: {str(e)}"
